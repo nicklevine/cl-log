@@ -1,0 +1,704 @@
+                    CL-LOG.LISP - A general purpose
+                    logging utility for Common Lisp
+
+                      Nick Levine and Nick Barnes
+                          Ravenbrook Limited
+                 ndl@ravenbrook.com, nb@ravenbrook.com
+
+                       Last updated 2012-05-15
+
+Contents:
+
+  1.  Introduction
+  2.  Examples
+  3.  Obtaining and installing CL-LOG
+  4.  The log-manager
+  5.  Timestamps
+  6.  Categories
+  7.  Messages
+  8.  Messengers
+
+
+1.  INTRODUCTION
+
+CL-LOG is a general purpose logging utility, loosely modelled in some
+respects after Gary King's "Log5" <http://common-lisp.net/project/log5/>.
+
+Its features include:
+    * logging to several destinations at once, via "messengers",
+    * each messenger is tailored to accept some log messages and
+      reject others, and this tailoring can be changed on-the-fly,
+    * very rapid processing of messages which are rejected by all
+      messengers,
+    * support for messengers which cl:format text to a stream,
+    * support for messengers which do not invoke cl:format,
+    * timestamps in theory accurate to internal-time-units-per-second.
+
+Typically, logging utilities only support the one, simple paradigm of
+formatting objects to a text-stream. Removing this restriction allows
+you to:
+    * log random objects instead of plain text,
+    * generate internationalized log messages,
+    * create specialised binary logs,
+    * base the test-suite of complex applications around logging.
+
+Logging is controlled by the following classes: log-manager,
+base-messenger, base-message, category-set; any of these might be
+specialised by your application. Whether or not a messenger will
+accept a given message is controlled by "categories" of messages and
+"filters" of messengers; these are logical combinations of atoms
+(typically keywords).
+
+The source code for CL-LOG is very nearly the same length as this
+documentation. You might find it less work to read the code instead.
+
+CL-LOG has an MIT-style license, a copy of which will be found at the
+end of this document.
+
+
+2.  EXAMPLES
+
+2.1. Getting started -- simple logging to a text file
+
+There is a two-step setup and then you're ready to go.
+
+First, create your log-manager and configure it for formatted messages:
+
+    (in-package cl-log)
+
+    (setf (log-manager)
+          (make-instance 'log-manager :message-class 'formatted-message))
+
+Next, instantiate a messenger and point it at your output file:
+
+    (start-messenger 'text-file-messenger
+                     :filename "/tmp/log.txt")
+
+We didn't give this messenger a filter, and this means it'll accept
+all messages.
+
+OK, we're ready to go.
+
+    (log-message :warning "Logging system poorly understood")
+    (log-message :coffee  "Levels replenished")
+
+The output file now contains something like:
+
+    3390537223.453 WARNING Logging system poorly understood
+    3390537225.218 COFFEE Levels replenished
+
+That's all there is to it.
+
+Where to go next? Consider using categories (start with sections 6.1
+and 6.4) to allow control over how much gets logged, and consider
+making the formatted output prettier by specialising the class
+formatted-message and defining a method on format-message (see section
+7.3).
+
+
+2.2. Logging to a ring, using categories
+
+When analysing a bug, you often want to review recent activity. A
+ring log is ideal for this: it keeps the most recent messages.
+
+Let's define some categories: in this example they're going to
+annotate the severities of situations which we wish to log. They range
+from "critical" at one end of the scale to "debug" at the other.
+
+    (defcategory :critical)
+    (defcategory :error   (or :error :critical))
+    (defcategory :warning (or :warning :error))
+    (defcategory :notice  (or :notice :warning))
+    (defcategory :info    (or :info :notice))
+    (defcategory :debug   (or :debug :info))
+
+Note the recursive inclusion: a messenger with the :debug filter will
+accept either :debug or :info messages, and so it'll accept either
+:debug, :info or :notice, and so on. It's quite safe to define a
+category in terms of itself.
+
+Next we fire up the log-manager:
+
+    (setf (log-manager) (make-instance 'log-manager))
+
+If you'd already run the file-logging example above, note that
+resetting (log-manager) will automatically stop the previous
+log-manager's messenger(s).
+
+The final step before we're ready to start logging is to create at
+least one messenger. The ring-messenger class records messages as raw
+objects, always retaining the most recent :length (in this case, 10)
+of them.
+
+    (start-messenger 'ring-messenger
+                     :length 10
+                     :filter '(and :info (not :error)))
+
+The :filter initarg above specifies that this messenger will only
+accept messages which are of category :info but not of category
+:error. Using the defcategory forms above, we can think of this as
+equivalent to (or :info :notice :warning). Calculating whether a
+message satisfies a combination like this isn't "for free", but the
+results are cached and so provided you don't keep redefining your
+categories (thousands of times per second, say) you'll get excellent
+performance no matter how complicated the combinations are.
+
+OK, let's log some messages. The first argument, always evaluated, to
+the log-message macro is the category of this message. The remaining
+arguments are only evaluated if the message is accepted by at least
+one messenger. In this toy example, we fire off half a dozen messages
+using the category of each as its contents:
+
+    (dolist (z '(:critical :error :warning :notice :info :debug))
+      (log-message z z))
+
+Now let's show that we logged everything which was at least :info
+provided it wasn't also at least :error
+
+    (loop for message in (ring-messenger-messages
+                          (car (log-manager-messengers (log-manager))))
+          when message collect (message-description message))
+
+    =>
+
+    (:WARNING :NOTICE :INFO)
+
+
+2.3. Advanced example: use in a library
+
+Suppose you're writing a library for others to use. The library
+clients might already be using cl-log, and/or might want to use other
+third-party libraries which also use it. You don't want your
+categories, your messengers, and so on to be a problem for them.
+Enter the "category set":
+
+    (setf *my-categories* (make-instance 'category-set))
+    (defcategory :meltdown  ()                        *my-categories*)
+    (defcategory :emergency (or :emergency :meltdown) *my-categories*)
+    (defcategory :alarm     (or :alarm :emergency)    *my-categories*)
+    (defcategory :warning   (or :warning :alarm)      *my-categories*)
+    (defcategory :cake      ()                        *my-categories*)
+    (defcategory :tea       ()                        *my-categories*)
+    (defcategory :break     (or :break :tea :cake)    *my-categories*)
+    (defcategory :siren     (or :siren :break :alarm) *my-categories*)
+    (setf *my-log-manager*
+	   (make-instance 'log-manager :categories *my-categories*))
+
+Note that the category set is the third argument to defcategory, so
+when you want to specify it, you cannot omit the second (expansion)
+argument, although you can set it to nil - as for :meltdown, :cake,
+and :tea above.
+
+All the relevant methods allow you to specify a log manager:
+
+    (start-messenger 'ring-messenger
+		     :manager *my-log-manager*
+		     :length 10
+		     :filter '(and :info (not :error)))
+
+And messages can be directed to a specific log manager:
+
+    (log-manager-message *my-log-manager* :warning "John's birthday")
+
+
+3.  OBTAINING AND INSTALLING CL-LOG
+
+3.1. Quicklisp
+
+CL-LOG is available via Quicklisp:
+
+    CL-USER > (ql:quickload :cl-log)
+    To load "cl-log":
+      Load 1 ASDF system:
+	cl-log
+    ; Loading "cl-log"
+    [package com.ravenbrook.common-lisp-log]...
+    (:CL-LOG)
+
+    CL-USER >
+
+
+3.2. Direct download
+
+CL-LOG can also be downloaded directly from
+https://www.nicklevine.org/cl-log/
+
+The source is in two lisp files: pkg.lisp and cl-log.lisp; compile and
+load them in that order. There's also an asdf file (cl-log.asd).
+
+
+3.3. Packages
+
+The package of any lisp symbol referenced in this document can be
+determined by selecting the first of the following which is applicable
+to that symbol:
+
+    1. the symbol's package is explicitly qualified;
+
+    2. the symbol belongs to the COMMON-LISP package;
+
+    3. if neither of the above applies then the symbol belongs to and
+       is exported from the COM.RAVENBROOK.COMMON-LISP-LOG package.
+
+The COM.RAVENBROOK.COMMON-LISP-LOG package has nickname CL-LOG. Its
+use-list is the system default.
+
+The version of CL-LOG can be determined from the value of
+*CL-LOG-RELEASE*. This is release 1.0.1.
+
+
+
+4.  THE LOG-MANAGER
+
+4.1. Global accessor log-manager
+
+(log-manager)
+(setf (log-manager) ...)
+
+There is always a current global log manager. The system starts up
+with a log manager with no messengers. (log-manager) returns the
+current global log manager; (setf (log-manager) x) sets it. The new
+value must be of type log-manager. If the old log manager had any
+messengers then they will be stopped, by calling stop-messenger on
+each of them.
+
+Make a temporary switch of the global log-manager with this macro:
+
+(rebinding-log-manager ((log-manager) &body body))
+
+Make a temporary switch to a new empty log-manager thus:
+
+   (rebinding-log-manager (nil)
+     ;; some code
+     )
+
+
+4.2. Class log-manager
+
+(defclass log-manager ...)
+
+This is the class of log-managers. You might or might not want to
+subclass it.
+
+Accessors on log-manager:
+
+(log-manager-messengers log-manager)
+(setf (log-manager-messengers log-manager) ...)
+
+The messengers of a log-manager. Typically you won't ever need to set
+this directly - see start-messenger and stop-messenger.
+
+(log-manager-message-class log-manager)
+(setf (log-manager-message-class log-manager) ...)
+
+A designator for the class of messages which the log manager will
+create. The log-manager class has initarg :message-class which will be
+sufficient for most uses. The message class defaults to 'base-message.
+
+(log-manager-category-set log-manager)
+(setf (log-manager-category-set log-manager) ...)
+
+The category-set of the log manager. Initialized with the :categories
+initarg, or from the current (log-manager) otherwise.
+
+(logging-disabled log-manager)
+(setf (logging-disabled log-manager) ...)
+
+Used to disable and re-enable logging globally.
+
+
+4.3. Disabling the log manager
+
+In addition to the logging-disabled setter above, there's the
+following macro:
+
+(with-logging-disabled &body body)
+
+Logging is disabled (for the current log manager) in the lexical scope
+of this form and returned to its previous state on exit, irrespective
+of any intervening calls to (setf logging-disabled). It's just like a
+variable binding. If you want to disable a specific manager:
+
+(with-log-manager-disabled (manager) &body body)
+
+
+4.4. Invalidating the log manager
+
+The generic-function invalidate-log-manager is called after categories
+are defined or undefined, and after log-manager-messengers is reset
+(e.g. after calling start-messenger or stop-messenger).
+
+You can depend on invalidate-log-manager being called before the next
+relevant log-message operation completes, but you cannot depend on
+exactly when this will be or how many times it will be called. (So,
+for instance, in this version of CL-LOG, several calls to defcategory
+with no intervening log-message will only cause invalidate-log-manager
+to be called once).
+
+CL-LOG supplies the primary method:
+
+(invalidate-log-manager (log-manager log-manager))
+
+You might want to define :after methods on this (for example, to close
+resources used by a subclass of log-manager).
+
+Note: this method doesn't actually "invalidate" the log manager, in
+the sense of disabling it. It invalidates the log manager's cache of
+the mapping from categories to messengers.
+
+
+
+5.  TIMESTAMPS
+
+Every message is automatically given a timestamp (provided it's been
+accepted by at least one messenger).
+
+(defstruct (timestamp ...) ...)
+
+You can subclass this using defstruct with :include, should you see
+the need.
+
+(make-timestamp (log-manager))
+
+Use this if you ever want a timestamp of your own to take home and
+play with.
+
+The timestamp has two readers:
+
+(timestamp-universal-time ts)
+(timestamp-fraction ts)
+
+The fraction is in internal-time-units-per-second.
+
+Warning: there's no obvious way in Common Lisp to tell what the
+current fractional value of the universal-time is. CL-LOG's timestamps
+add the universal-time when the log-manager was instantiated to the
+change in (get-internal-real-time) since then. This means that
+timestamps will be self-consistent but not externally consistent: the
+fraction will be zero when the timestamp-universal-time changes but
+probably won't be zero when the system's univeral-time changes.
+
+
+6.  CATEGORIES
+
+6.1. Messages, messengers and category-satisfies
+
+Every message has a set of categories, specified by the first argument
+to log-message or the second argument to log-manager-message. It may
+be either an atom or a list of atoms (meaning: all these categories
+apply to this message).
+
+Every messenger has a filter, specified when the messenger is
+instantiated, which defines the message categories which that
+messenger will accept. The messenger's filter cannot be changed, but
+you can use defcategory / defcategory-fn (see below) to tailor
+on-the-fly how message categories and messenger filters are related.
+
+A messenger's filter is either null (meaning: accept all messages), or
+an atom (meaning: accept messages in this category), or a list
+starting with one of AND, OR and NOT (meaning: a logical combination
+of filters). It's suggested that the atoms should be keywords; this
+version of CL-LOG doesn't enforce that but it leaves space for future
+expansions in which (e.g.) funcallables might have some meaning.
+
+The function category-satisfies is called to determine whether its
+first argument (a message category or list of categories) "satisfies"
+its second argument (a messenger filter):
+
+    ;; needed either, got both, so satisfied
+    (category-satisfies '(:this :that) '(or :this :that)) => T
+
+    (category-satisfies :error (and :info (not :error))) => NIL
+
+
+6.2. defcategory
+
+The macro defcategory is used to define the expansions for messengers'
+filters. For example, given:
+
+    (defcategory :interesting (or :important :urgent))
+
+we have not only
+
+    (category-satisfies :interesting :interesting) => T
+
+but also
+
+    ;; this message is urgent -- will it be accepted by a messenger
+    ;; which expects its messages to be interesting?
+    (category-satisfies :urgent :interesting) => T
+
+These expansions only affect the messengers' filters (and not the
+categories of the messages):
+
+    ;; this message is interesting -- will it be accepted by a
+    ;; messenger which expects its messages to be urgent?
+    (category-satisfies :interesting :urgent) => NIL
+
+
+6.3. Advanced defcategory
+
+For clarity, you can also define a category without an expansion, as
+in the example at the start of this document:
+
+    (defcategory :critical)
+
+This has no semantic meaning (and although it will overwrite a
+previous expansion for :critical, it's clearer for you to use
+undefcategory). It might make your code more readable.
+
+Note that you can define a category in terms of itself:
+
+    (defcategory :warning (or :warning :error))
+
+This is quite safe. It means the same as:
+
+    (defcategory :warning :error)
+
+- the messenger will accept either warnings or errors. This last use
+came to me as I was writing this document. It's an interesting quirk
+but I don't much care for it as it really doesn't read well.
+
+
+6.4. defcategory-fn
+
+The defcategory macro expands into calls to the function
+defcategory-fn. This function may be useful if you wish to change the
+filter of one or more messengers on the fly.
+
+For example, you might do this by setting the filter of the
+messenger(s) to be :log-level and defining
+
+    (defun (setf log-level) (new-value)
+      (defcategory-fn :log-level new-value))
+
+All your application has to do is to (setf (log-level) :warning) or
+whatever, for all :log-level messengers to respond to warnings.
+
+
+6.5. Undefining categories
+
+The macro undefcategory removes the expansion of a category. Example:
+
+    (undefcategory :debug)
+
+This expands to a call to undefcategory-fn, analogously to
+defcategory-fn.
+
+The function (clear-categories) undefines all category expansions.
+
+
+6.6. Advanced use: category sets
+
+A category set is an object managing a set of categories. This allows
+you to separate your categories from those which any other module in
+the system might be using.
+
+An empty category set can be made with:
+
+   (make-instance 'category-set)
+
+A log manager has a category set (log-manager-category-set
+log-manager). Ordinarily, a newly-created log manager will share the
+category set of the current log manager.
+
+The defcategory macro can take a category set as an optional argument,
+thus:
+
+(defcategory :error (or :error :critical) my-category-set)
+
+If no category set is specified, the category set of the current log
+manager is used. Thus in ordinary use, there will be a single
+category set, which is shared between all log managers, and which
+manages all the categories.
+
+However, for advanced use it is possible to create a new category set
+(make-instance 'category-set), to populate that set with categories by
+using the set argument to defcategory or defcategory-fn, and to make a
+log-manager using that set (by creating it with the :categories
+initarg, or by (setf (log-manager-category-set log-manager) ...).
+
+The undefcategory macro, the undefcategory-fn, and the
+clear-categories function all also take an optional set argument.
+
+
+7.  MESSAGES
+
+7.1. log-message
+
+The macro log-message is used to send messages.
+
+    (log-message category description &rest arguments)
+
+The category, always evaluated, is compared using category-satisfies
+with the filter of each messenger to determine which if any
+messenger(s) will accept the message. The results of this comparison
+are cached, so next time you log a message with this category the
+lookup will be fast.
+
+Provided at least one messenger accepts the message, a message object
+is instantiated and given a fresh timestamp and the category; the
+description and arguments are evaluated and set into the message. The
+class of this object is determined by (log-manager-message-class
+(log-manager)).
+
+For advanced use, you can send a message to any log manager, not just
+the global log manager:
+
+    (log-manager-message manager category description &rest arguments)
+
+
+7.2. Class base-message
+
+This is the root class for messages. The following readers are
+provided:
+
+  message-timestamp
+  message-category
+  message-description
+  message-arguments
+
+
+7.3. Class formatted-message
+
+This subclass of base-message is for messages which will be formatted
+to a text stream. The following reader is provided:
+
+  message-text
+
+This value is generated (lazily) by calling the generic function
+format-message whose primary method is defined thus:
+
+  (defmethod format-message ((self formatted-message))
+    (format nil "~a ~a ~?~&"
+            (message-timestamp self)
+            (message-category self)
+            (message-description self)
+            (message-arguments self)))
+
+You probably want to specialise this.
+
+
+8.  MESSENGERS
+
+8.1. Class base-messenger
+
+This is the root class for messengers.
+
+To instantiate and activate a messenger, call start-messenger.
+
+   (start-messenger class &rest initargs &key manager name &allow-other-keys)
+
+To deactivate a messenger, call stop-messenger. This generic function
+will accept either a messenger (i.e. the object returned by
+start-messenger) or the name of a messenger. There are two methods on
+stop-messenger
+
+   (defmethod stop-messenger ((self base-messenger) &key))
+   (defmethod stop-messenger (name &key manager)
+
+and you're free to add more.
+
+Only one messenger with a given name (equalp) may be started in any
+given manager at any one time. Starting a new messenger in a manager
+with an name of an existing messenger in that manager will
+automatically stop the old one.
+
+The function call (find-messenger name &key manager) returns the
+messenger (if any) with the given name.
+
+The following readers are provided for instances of base-messenger:
+
+  messenger-manager (initarg :manager)
+  messenger-name (initarg :name)
+  messenger-filter (initarg :filter)
+
+For backwards compatibility, messenger-category and initarg :category
+are synonymous with messenger-filter and :filter respectively.
+
+
+8.2. Generic function messenger-send-message
+
+This generic function is called once for each messenger which has
+accepted any given message. It defines what the messengers will
+actually do with their messages.
+
+  (defgeneric messenger-send-message (messenger message))
+
+Three methods are provided. The first
+
+  (defmethod messenger-send-message ((messenger base-messenger) message))
+
+signals an error. The other two are specialised on ring-messenger
+(section 8.3) and text-stream-messenger (section 8.4) respectively. If
+your messenger doesn't inherit from one of these two classes, you'll
+have to define a method on messenger-send-message.
+
+
+8.3. Class ring-messenger
+
+This subclass of base-messenger allows you to specify -- via the :length
+initarg --  how many messages you wish to keep. It retains this number of
+messages (as raw objects) and is thus designed to give cheap access to
+your application's recent actions. Retrieve the messages with the
+accessor ring-messenger-messages.
+
+The message class base-message is sufficient for ring-messengers.
+
+This class is dead useful in error handlers.
+
+
+8.4. Class text-stream-messenger
+
+This subclass of base-messenger handles the output of log messages as
+formatted text to a stream. Specify this stream with the :stream
+initarg (associated reader text-stream-messenger-stream).
+
+You'll need messages of class formatted-message (section 7.3) in order
+to use text-stream-messengers. The method on messenger-send-message
+specialised on these two classes looks a little bit like this.
+
+  (defmethod messenger-send-message ((messenger text-stream-messenger)
+                                     (message formatted-message))
+    (let ((ostream (text-stream-messenger-stream messenger)))
+      (write-string (message-text message) ostream)))
+
+Calling stop-messenger on a text-stream-messenger will automatically
+close the associated stream.
+
+
+8.5. Class text-file-messenger
+
+This subclass of text-stream-messenger supports output to a
+text-file. Specify the file with the :filename initarg (associated
+reader text-file-messenger-file).
+
+
+COPYRIGHT
+
+This file copyright (c) 2007 - 2012 Nick Levine (ndl@ravenbrook.com) and
+Nick Barnes (nb@ravenbrook.com).
+
+Log5 copyright (c) 2007 Gary Warren King (gwking@metabang.com)
+
+Permission is hereby granted, free of charge, to any person obtaining
+a copy of this software and associated documentation files (the
+"Software"), to deal in the Software without restriction, including
+without limitation the rights to use, copy, modify, merge, publish,
+distribute, sublicense, and/or sell copies of the Software, and to
+permit persons to whom the Software is furnished to do so, subject to
+the following conditions:
+
+The above copyright notice and this permission notice shall be
+included in all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
+IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,
+TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
+SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+
+$Id: //info.ravenbrook.com/user/ndl/lisp/cl-log/master/doc/index.txt#6 $
